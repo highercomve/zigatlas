@@ -1,16 +1,12 @@
 //! What to scan and which rules to hold the code to, parsed from the command
-//! line. build.zig's `addAtlasStep` turns its Options into these arguments.
+//! line. build.zig's `addAtlasStep` turns its Options into these arguments and
+//! takes its defaults and its Layer and Rule types from here.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Severity = @import("model.zig").Severity;
+const model = @import("model.zig");
+const Severity = model.Severity;
 
-pub const Layer = struct {
-    name: []const u8,
-    /// Path prefixes (directories or single files) that belong to the layer.
-    paths: []const []const u8,
-    /// Front ends: should only parse input and present output.
-    thin: bool = false,
-};
+pub const Layer = model.Layer;
 
 pub const Rule = struct {
     /// Layer name or path prefix.
@@ -20,13 +16,21 @@ pub const Rule = struct {
 };
 
 pub const Module = struct {
+    /// The name in `@import("name")`.
     name: []const u8,
+    /// The project file it resolves to.
     path: []const u8,
+    /// Directory of the module that imports it under this name; empty means
+    /// everywhere. Lets one name mean different files in different modules.
+    scope: []const u8 = "",
 };
 
 pub const Config = struct {
     name: []const u8 = "project",
     roots: []const []const u8 = &.{},
+    /// Extra places whose files are only searched for uses of names (tests,
+    /// tools), so their calls count for `unused_pub`. Default: the whole cwd.
+    usage_roots: []const []const u8 = &.{},
     exclude: []const []const u8 = &.{},
     /// Ordered top (front ends) to bottom (foundations): a layer may import
     /// itself and anything below it.
@@ -66,6 +70,24 @@ pub const Config = struct {
         }
         return best;
     }
+
+    /// The file `@import(name)` means inside `importer`: the module with the
+    /// longest scope containing the importer, else an unscoped one.
+    pub fn moduleFor(cfg: Config, name: []const u8, importer: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_len: usize = 0;
+        var found = false;
+        for (cfg.modules) |m| {
+            if (!std.mem.eql(u8, m.name, name)) continue;
+            if (m.scope.len > 0 and !pathHasPrefix(importer, m.scope)) continue;
+            if (!found or m.scope.len > best_len) {
+                best = m.path;
+                best_len = m.scope.len;
+                found = true;
+            }
+        }
+        return best;
+    }
 };
 
 /// True when `path` is `prefix` itself or lies under the directory `prefix`.
@@ -76,36 +98,63 @@ pub fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
     return path.len == p.len or path[p.len] == '/';
 }
 
-pub const usage =
+/// The one spelling of a path zigatlas uses everywhere: relative to the cwd,
+/// '/' separators, no `.` or `..` steps where they can be removed, no
+/// trailing slash; the cwd itself is ".". Roots, scanned files, layers,
+/// excludes, rules and modules all go through here so they compare equal.
+pub fn normalizePath(arena: Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
+    const slashed = try arena.dupe(u8, path);
+    std.mem.replaceScalar(u8, slashed, '\\', '/');
+    const relative = if (std.fs.path.isAbsolutePosix(slashed))
+        try std.fs.path.relativePosix(arena, cwd, cwd, slashed)
+    else
+        try std.fs.path.resolvePosix(arena, &.{slashed});
+    return if (relative.len == 0) "." else relative;
+}
+
+const defaults: Config = .{};
+
+pub const usage = std.fmt.comptimePrint(
     \\usage: zigatlas [options]
     \\
     \\  --name NAME              project name for the report
     \\  --root PATH              directory or file to scan (repeatable, default: src)
+    \\  --usage-root PATH        only count uses of names here, e.g. tests (default: .)
     \\  --exclude PATH           path prefix to skip (repeatable)
     \\  --layer NAME=P1,P2       layer owning these paths; give layers top to bottom
     \\  --thin NAME              mark a layer as a thin front end
     \\  --forbid FROM:TO[:WHY]   forbid imports from a layer/path to another
-    \\  --module NAME=PATH       resolve @import("NAME") to a project file
-    \\  --out DIR                output directory (default: zig-out/atlas)
-    \\  --min-clone-tokens N     shortest duplicated fragment reported (60)
-    \\  --min-fn-tokens N        smallest function compared as a whole (40)
-    \\  --max-fn-lines N         (80)   --max-complexity N  (20)
-    \\  --max-params N           (6)    --max-file-lines N  (1000)
-    \\  --thin-max-complexity N  (10)
-    \\  --check [warn|error]     exit 1 when findings at this severity exist
+    \\  --module NAME=PATH[@DIR] resolve @import("NAME") (inside DIR) to a project file
+    \\  --out DIR                output directory (default: {s})
+    \\  --min-clone-tokens N     shortest duplicated fragment reported ({d})
+    \\  --min-fn-tokens N        smallest function compared as a whole ({d})
+    \\  --max-fn-lines N         ({d})   --max-complexity N  ({d})
+    \\  --max-params N           ({d})    --max-file-lines N  ({d})
+    \\  --thin-max-complexity N  ({d})
+    \\  --check [info|warn|error] exit 1 when findings at this severity exist (default: error)
     \\
-;
+, .{
+    defaults.out_dir,        defaults.min_clone_tokens, defaults.min_fn_tokens,  defaults.max_fn_lines,
+    defaults.max_complexity, defaults.max_params,       defaults.max_file_lines, defaults.thin_max_complexity,
+});
 
 pub const ParseError = error{InvalidArguments} || Allocator.Error;
 
-pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Config {
+/// Lists collected while parsing, turned into the Config's slices at the end.
+const Lists = struct {
+    roots: std.ArrayList([]const u8) = .empty,
+    usage_roots: std.ArrayList([]const u8) = .empty,
+    exclude: std.ArrayList([]const u8) = .empty,
+    layers: std.ArrayList(Layer) = .empty,
+    forbid: std.ArrayList(Rule) = .empty,
+    modules: std.ArrayList(Module) = .empty,
+    thin: std.ArrayList([]const u8) = .empty,
+};
+
+/// Parses the arguments; every path is normalised against `cwd`.
+pub fn parse(arena: Allocator, args: []const []const u8, cwd: []const u8) ParseError!Config {
     var cfg: Config = .{};
-    var roots: std.ArrayList([]const u8) = .empty;
-    var exclude: std.ArrayList([]const u8) = .empty;
-    var layers: std.ArrayList(Layer) = .empty;
-    var forbid: std.ArrayList(Rule) = .empty;
-    var modules: std.ArrayList(Module) = .empty;
-    var thin: std.ArrayList([]const u8) = .empty;
+    var lists: Lists = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -119,54 +168,13 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Config {
             continue;
         }
         if (i + 1 >= args.len) return fail("missing value for", arg);
-        const value = args[i + 1];
         i += 1;
-        if (std.mem.eql(u8, arg, "--name")) {
-            cfg.name = value;
-        } else if (std.mem.eql(u8, arg, "--root")) {
-            try roots.append(arena, trimSlash(value));
-        } else if (std.mem.eql(u8, arg, "--exclude")) {
-            try exclude.append(arena, trimSlash(value));
-        } else if (std.mem.eql(u8, arg, "--layer")) {
-            const eq = std.mem.indexOfScalar(u8, value, '=') orelse return fail("--layer wants NAME=PATHS", value);
-            var paths: std.ArrayList([]const u8) = .empty;
-            var it = std.mem.tokenizeScalar(u8, value[eq + 1 ..], ',');
-            while (it.next()) |p| try paths.append(arena, trimSlash(p));
-            try layers.append(arena, .{ .name = value[0..eq], .paths = paths.items });
-        } else if (std.mem.eql(u8, arg, "--thin")) {
-            try thin.append(arena, value);
-        } else if (std.mem.eql(u8, arg, "--forbid")) {
-            var it = std.mem.splitScalar(u8, value, ':');
-            const from = it.next() orelse "";
-            const to = it.next() orelse return fail("--forbid wants FROM:TO[:WHY]", value);
-            try forbid.append(arena, .{ .from = trimSlash(from), .to = trimSlash(to), .reason = it.rest() });
-        } else if (std.mem.eql(u8, arg, "--module")) {
-            const eq = std.mem.indexOfScalar(u8, value, '=') orelse return fail("--module wants NAME=PATH", value);
-            try modules.append(arena, .{ .name = value[0..eq], .path = value[eq + 1 ..] });
-        } else if (std.mem.eql(u8, arg, "--out")) {
-            cfg.out_dir = value;
-        } else if (std.mem.eql(u8, arg, "--min-clone-tokens")) {
-            cfg.min_clone_tokens = try number(value);
-        } else if (std.mem.eql(u8, arg, "--min-fn-tokens")) {
-            cfg.min_fn_tokens = try number(value);
-        } else if (std.mem.eql(u8, arg, "--max-fn-lines")) {
-            cfg.max_fn_lines = try number(value);
-        } else if (std.mem.eql(u8, arg, "--max-complexity")) {
-            cfg.max_complexity = try number(value);
-        } else if (std.mem.eql(u8, arg, "--max-params")) {
-            cfg.max_params = try number(value);
-        } else if (std.mem.eql(u8, arg, "--max-file-lines")) {
-            cfg.max_file_lines = try number(value);
-        } else if (std.mem.eql(u8, arg, "--thin-max-complexity")) {
-            cfg.thin_max_complexity = try number(value);
-        } else {
-            return fail("unknown option", arg);
-        }
+        try parseOption(arena, cwd, &cfg, &lists, arg, args[i]);
     }
 
-    for (thin.items) |name| {
+    for (lists.thin.items) |name| {
         var found = false;
-        for (layers.items) |*layer| {
+        for (lists.layers.items) |*layer| {
             if (std.mem.eql(u8, layer.name, name)) {
                 layer.thin = true;
                 found = true;
@@ -174,24 +182,91 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Config {
         }
         if (!found) return fail("--thin names an unknown layer", name);
     }
-    if (roots.items.len == 0) try roots.append(arena, "src");
+    if (lists.roots.items.len == 0) try lists.roots.append(arena, "src");
+    if (lists.usage_roots.items.len == 0) try lists.usage_roots.append(arena, ".");
     if (cfg.min_clone_tokens < 10) cfg.min_clone_tokens = 10;
 
-    cfg.roots = roots.items;
-    cfg.exclude = exclude.items;
-    cfg.layers = layers.items;
-    cfg.forbid = forbid.items;
-    cfg.modules = modules.items;
+    cfg.roots = lists.roots.items;
+    cfg.usage_roots = lists.usage_roots.items;
+    cfg.exclude = lists.exclude.items;
+    cfg.layers = lists.layers.items;
+    cfg.forbid = lists.forbid.items;
+    cfg.modules = lists.modules.items;
+    for (cfg.forbid) |rule| {
+        try checkSelector(cfg, rule.from);
+        try checkSelector(cfg, rule.to);
+    }
     return cfg;
 }
 
-fn trimSlash(s: []const u8) []const u8 {
-    const t = if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
-    return std.mem.trimEnd(u8, t, "/");
+fn parseOption(arena: Allocator, cwd: []const u8, cfg: *Config, lists: *Lists, arg: []const u8, value: []const u8) ParseError!void {
+    if (std.mem.eql(u8, arg, "--name")) {
+        cfg.name = value;
+    } else if (std.mem.eql(u8, arg, "--root")) {
+        try lists.roots.append(arena, try normalizePath(arena, cwd, value));
+    } else if (std.mem.eql(u8, arg, "--usage-root")) {
+        try lists.usage_roots.append(arena, try normalizePath(arena, cwd, value));
+    } else if (std.mem.eql(u8, arg, "--exclude")) {
+        try lists.exclude.append(arena, try normalizePath(arena, cwd, value));
+    } else if (std.mem.eql(u8, arg, "--layer")) {
+        const eq = std.mem.indexOfScalar(u8, value, '=') orelse return fail("--layer wants NAME=PATHS", value);
+        var paths: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeScalar(u8, value[eq + 1 ..], ',');
+        while (it.next()) |p| try paths.append(arena, try normalizePath(arena, cwd, p));
+        try lists.layers.append(arena, .{ .name = value[0..eq], .paths = paths.items });
+    } else if (std.mem.eql(u8, arg, "--thin")) {
+        try lists.thin.append(arena, value);
+    } else if (std.mem.eql(u8, arg, "--forbid")) {
+        var it = std.mem.splitScalar(u8, value, ':');
+        const from = it.next() orelse "";
+        const to = it.next() orelse return fail("--forbid wants FROM:TO[:WHY]", value);
+        try lists.forbid.append(arena, .{ .from = try selector(arena, cwd, from), .to = try selector(arena, cwd, to), .reason = it.rest() });
+    } else if (std.mem.eql(u8, arg, "--module")) {
+        const eq = std.mem.indexOfScalar(u8, value, '=') orelse return fail("--module wants NAME=PATH[@DIR]", value);
+        const rest = value[eq + 1 ..];
+        const at = std.mem.lastIndexOfScalar(u8, rest, '@');
+        try lists.modules.append(arena, .{
+            .name = value[0..eq],
+            .path = try normalizePath(arena, cwd, if (at) |a| rest[0..a] else rest),
+            .scope = if (at) |a| try normalizePath(arena, cwd, rest[a + 1 ..]) else "",
+        });
+    } else if (std.mem.eql(u8, arg, "--out")) {
+        cfg.out_dir = value;
+    } else {
+        const field = numberField(arg) orelse return fail("unknown option", arg);
+        const n = std.fmt.parseInt(u32, value, 10) catch return fail("not a number", value);
+        switch (field) {
+            inline else => |f| @field(cfg, @tagName(f)) = n,
+        }
+    }
 }
 
-fn number(s: []const u8) ParseError!u32 {
-    return std.fmt.parseInt(u32, s, 10) catch fail("not a number", s);
+const NumberField = enum { min_clone_tokens, min_fn_tokens, max_fn_lines, max_complexity, max_params, max_file_lines, thin_max_complexity };
+
+/// `--max-fn-lines` -> .max_fn_lines
+fn numberField(arg: []const u8) ?NumberField {
+    if (!std.mem.startsWith(u8, arg, "--")) return null;
+    var buf: [32]u8 = undefined;
+    if (arg.len - 2 > buf.len) return null;
+    const name = buf[0 .. arg.len - 2];
+    for (arg[2..], name) |c, *o| o.* = if (c == '-') '_' else c;
+    return std.meta.stringToEnum(NumberField, name);
+}
+
+/// A rule side: a layer name stays as it is, a path is normalised.
+fn selector(arena: Allocator, cwd: []const u8, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfAny(u8, s, "/\\.") == null) return s;
+    return normalizePath(arena, cwd, s);
+}
+
+/// A rule side must name a layer or a path inside (or around) a root, so a
+/// typo can't switch the rule off.
+fn checkSelector(cfg: Config, s: []const u8) ParseError!void {
+    if (cfg.layerIndex(s) != null) return;
+    for (cfg.roots) |root| {
+        if (pathHasPrefix(s, root) or pathHasPrefix(root, s)) return;
+    }
+    return fail("--forbid names neither a layer nor a path under a root", s);
 }
 
 fn fail(what: []const u8, arg: []const u8) ParseError {
@@ -203,13 +278,16 @@ test "parse layers, rules and thresholds" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try parse(arena_state.allocator(), &.{
-        "--root",       "src/",      "--layer",  "cli=src/main.zig",
-        "--layer",      "fs=src/fs", "--layer",  "net=src/net,src/dht",
-        "--thin",       "cli",       "--forbid", "fs:net:go through cluster",
-        "--max-params", "4",         "--check",
-    });
+        "--root",                 "./src/",    "--layer",  "cli=src/main.zig",
+        "--layer",                "fs=src/fs", "--layer",  "net=/proj/src/net,src/dht",
+        "--thin",                 "cli",       "--forbid", "fs:net:go through cluster",
+        "--max-params",           "4",         "--check",  "--module",
+        "pkg=./src/root.zig@app",
+    }, "/proj");
     try std.testing.expectEqualStrings("src", cfg.roots[0]);
+    try std.testing.expectEqualStrings(".", cfg.usage_roots[0]);
     try std.testing.expectEqual(@as(usize, 3), cfg.layers.len);
+    try std.testing.expectEqualStrings("src/net", cfg.layers[2].paths[0]);
     try std.testing.expect(cfg.layers[0].thin);
     try std.testing.expectEqualStrings("go through cluster", cfg.forbid[0].reason);
     try std.testing.expectEqual(@as(u32, 4), cfg.max_params);
@@ -217,4 +295,26 @@ test "parse layers, rules and thresholds" {
     try std.testing.expectEqualStrings("net", cfg.layerOf("src/dht/kad.zig").?);
     try std.testing.expectEqualStrings("cli", cfg.layerOf("src/main.zig").?);
     try std.testing.expect(cfg.layerOf("src/mainly.zig") == null);
+    try std.testing.expectEqualStrings("src/root.zig", cfg.moduleFor("pkg", "app/main.zig").?);
+    try std.testing.expect(cfg.moduleFor("pkg", "src/x.zig") == null);
+}
+
+test "paths are spelled one way" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings(".", try normalizePath(a, "/p", "."));
+    try std.testing.expectEqualStrings(".", try normalizePath(a, "/p", "./"));
+    try std.testing.expectEqualStrings(".", try normalizePath(a, "/p", "/p"));
+    try std.testing.expectEqualStrings("src/a.zig", try normalizePath(a, "/p", "./src//a.zig"));
+    try std.testing.expectEqualStrings("src/a.zig", try normalizePath(a, "/p", "/p/src/a.zig"));
+    try std.testing.expectEqualStrings("src/a", try normalizePath(a, "/p", "src\\a\\"));
+}
+
+test "a misspelt rule is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.InvalidArguments, parse(arena_state.allocator(), &.{
+        "--layer", "top=src/top", "--forbid", "botom:top",
+    }, "/p"));
 }

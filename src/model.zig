@@ -1,14 +1,30 @@
 //! The atlas: everything zigatlas learns about a code base, in the shape it is
 //! written to atlas.json. Scanning fills it, checks add findings to it and the
-//! renderers only read it.
+//! renderers only read it. Field changes are additive; `schema` goes up when
+//! one is not.
 const std = @import("std");
 
+/// atlas.json format version.
+pub const schema_version = 1;
+
 pub const Atlas = struct {
+    schema: u32 = schema_version,
+    /// The layers the run checked, top to bottom.
+    layers: []const Layer = &.{},
     files: []File,
     functions: []Function,
     containers: []Container,
     findings: []Finding,
     stats: Stats,
+};
+
+/// A layer of the architecture (configured in config.zig, recorded in the atlas).
+pub const Layer = struct {
+    name: []const u8,
+    /// Path prefixes (directories or single files) that belong to the layer.
+    paths: []const []const u8,
+    /// Front ends: should only parse input and present output.
+    thin: bool = false,
 };
 
 pub const Stats = struct {
@@ -19,6 +35,25 @@ pub const Stats = struct {
     containers: u32 = 0,
     tests: u32 = 0,
     import_edges: u32 = 0,
+
+    pub fn compute(files: []const File, functions: []const Function, containers: []const Container) Stats {
+        var s: Stats = .{
+            .files = @intCast(files.len),
+            .functions = @intCast(functions.len),
+            .containers = @intCast(containers.len),
+        };
+        for (files) |f| {
+            s.lines += f.lines;
+            s.tests += f.tests;
+            for (f.imports) |imp| {
+                if (imp.resolved != null) s.import_edges += 1;
+            }
+        }
+        for (functions) |f| {
+            if (f.is_pub) s.pub_functions += 1;
+        }
+        return s;
+    }
 };
 
 pub const File = struct {
@@ -34,6 +69,12 @@ pub const File = struct {
     /// Files importing this one (resolved imports only).
     fan_in: u32 = 0,
     parse_errors: u32 = 0,
+    /// Line of the first parse error (0 when there is none).
+    parse_error_line: u32 = 0,
+    /// Why the file was not parsed at all, when it wasn't.
+    parse_note: []const u8 = "",
+    /// Reason from an `@atlas allow` in the `//!` header; mutes file-level findings.
+    allowed: ?[]const u8 = null,
 };
 
 pub const Import = struct {
@@ -52,7 +93,9 @@ pub const Function = struct {
     /// `path/to/file.zig:Type.name`
     id: []const u8,
     name: []const u8,
-    /// Containing type chain inside the file, empty at file scope.
+    /// Containing type chain inside the file, empty at file scope. Methods of
+    /// a generic type (`fn List(T) type { return struct {...} }`) are owned by
+    /// the function's name.
     owner: []const u8,
     file: []const u8,
     line: u32,
@@ -61,16 +104,19 @@ pub const Function = struct {
     params: u32,
     /// Cyclomatic estimate: 1 + branches (if, while, for, catch, orelse, and, or, extra switch prongs).
     complexity: u32,
-    /// Deepest block nesting inside the body.
+    /// Deepest block nesting inside the body (struct literals don't count).
     depth: u32,
     is_pub: bool,
     /// `export fn`: called from C or another language, never by name here.
     is_export: bool = false,
+    /// `extern fn` prototype: no body.
+    is_extern: bool = false,
     signature: []const u8,
     doc: []const u8 = "",
     /// Body size in tokens, the unit clone detection works in.
     tokens: u32 = 0,
-    /// Cross-file calls through import aliases, as `file.zig:Name.path`.
+    /// Cross-file calls through import aliases, re-exports and typed
+    /// parameters, as `file.zig:Name.path`.
     calls: [][]const u8 = &.{},
     allowed: ?[]const u8 = null,
 };
@@ -82,6 +128,8 @@ pub const Container = struct {
     file: []const u8,
     line: u32,
     is_pub: bool,
+    /// A tuple struct: fields are named by position.
+    tuple: bool = false,
     doc: []const u8 = "",
     fields: []Field = &.{},
     methods: u32 = 0,
@@ -102,6 +150,13 @@ pub const Severity = enum {
         return @intFromEnum(s);
     }
 };
+
+/// Findings per severity, indexed by `Severity.rank()`.
+pub fn countBySeverity(findings: []const Finding) [3]u32 {
+    var counts = [_]u32{ 0, 0, 0 };
+    for (findings) |f| counts[f.severity.rank()] += 1;
+    return counts;
+}
 
 pub const FindingKind = enum {
     /// Two or more functions whose bodies are the same once local names and literals are ignored.
@@ -124,9 +179,11 @@ pub const FindingKind = enum {
     complex_function,
     many_params,
     large_file,
-    /// A public function whose name appears nowhere else in the scanned code.
+    /// A public function whose name appears nowhere else in the project.
     unused_pub,
     parse_error,
+    /// An `@atlas layer` annotation naming a layer the configuration doesn't have.
+    unknown_layer,
 };
 
 pub const Location = struct {

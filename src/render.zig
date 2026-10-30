@@ -6,10 +6,16 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const model = @import("model.zig");
 const Config = @import("config.zig").Config;
+const checks = @import("checks.zig");
 
 /// Findings listed per kind in ATLAS.md; atlas.json has them all.
 const max_per_kind = 30;
 const max_locations = 6;
+/// Rows in each hotspot list.
+const top_functions = 15;
+const top_files = 10;
+/// Fields shown per type in api.md.
+const max_fields = 10;
 
 pub fn json(arena: Allocator, atlas: model.Atlas) ![]const u8 {
     var out: Writer.Allocating = .init(arena);
@@ -45,7 +51,7 @@ pub fn overview(arena: Allocator, cfg: *const Config, atlas: model.Atlas) ![]con
     try findingSummary(w, atlas.findings);
     try layerSection(arena, w, cfg, atlas);
     try dirSection(arena, w, atlas);
-    try findingSection(w, atlas.findings);
+    try findingSection(arena, w, atlas.findings);
     try hotspotSection(arena, w, atlas);
     return out.written();
 }
@@ -147,8 +153,11 @@ fn dirSection(arena: Allocator, w: *Writer, atlas: model.Atlas) !void {
     try w.writeAll("\n\n");
 }
 
-fn findingSection(w: *Writer, findings: []const model.Finding) !void {
+fn findingSection(arena: Allocator, w: *Writer, unsorted: []const model.Finding) !void {
     try w.writeAll("## Findings\n\nMost severe first. `atlas.json` lists every finding.\n");
+    // Grouping below needs the findings in order; don't rely on the caller.
+    const findings = try arena.dupe(model.Finding, unsorted);
+    checks.sortFindings(findings);
     var i: usize = 0;
     while (i < findings.len) {
         const kind = findings[i].kind;
@@ -190,7 +199,7 @@ fn hotspotSection(arena: Allocator, w: *Writer, atlas: model.Atlas) !void {
             return a.complexity > b.complexity;
         }
     }.less);
-    for (fns[0..@min(fns.len, 15)]) |f| {
+    for (fns[0..@min(fns.len, top_functions)]) |f| {
         try w.print("| `{s}:{d}` {s} | {d} | {d} | {d} | {d} |\n", .{ f.file, f.line, qualifiedName(f), f.complexity, f.depth, f.lines, f.params });
     }
 
@@ -201,7 +210,7 @@ fn hotspotSection(arena: Allocator, w: *Writer, atlas: model.Atlas) !void {
             return a.fan_in > b.fan_in;
         }
     }.less);
-    for (files[0..@min(files.len, 10)]) |f| try w.print("- `{s}` ← {d}\n", .{ f.path, f.fan_in });
+    for (files[0..@min(files.len, top_files)]) |f| try w.print("- `{s}` ← {d}\n", .{ f.path, f.fan_in });
 
     try w.writeAll("\n### Files importing the most (fan-out): candidates for doing too much\n\n");
     std.mem.sort(model.File, files, {}, struct {
@@ -209,7 +218,7 @@ fn hotspotSection(arena: Allocator, w: *Writer, atlas: model.Atlas) !void {
             return fanOut(a) > fanOut(b);
         }
     }.less);
-    for (files[0..@min(files.len, 10)]) |f| try w.print("- `{s}` → {d}\n", .{ f.path, fanOut(f) });
+    for (files[0..@min(files.len, top_files)]) |f| try w.print("- `{s}` → {d}\n", .{ f.path, fanOut(f) });
     try w.writeAll("\n");
 }
 
@@ -232,8 +241,20 @@ pub fn api(arena: Allocator, cfg: *const Config, atlas: model.Atlas) ![]const u8
     const w = &out.writer;
     try w.print("# API map: {s}\n\nEvery file with its doc line, public types (with fields) and public functions.\nSearch here before adding a helper; reuse or move what exists instead.\n", .{cfg.name});
 
+    // Each file's types and functions, gathered in one pass.
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
+    for (atlas.files, 0..) |f, i| try index.put(arena, f.path, i);
+    const types = try arena.alloc(std.ArrayList(model.Container), atlas.files.len);
+    const funs = try arena.alloc(std.ArrayList(model.Function), atlas.files.len);
+    for (types, funs) |*t, *fu| {
+        t.* = .empty;
+        fu.* = .empty;
+    }
+    for (atlas.containers) |c| try types[index.get(c.file) orelse continue].append(arena, c);
+    for (atlas.functions) |fun| try funs[index.get(fun.file) orelse continue].append(arena, fun);
+
     var dir: []const u8 = "";
-    for (atlas.files) |f| {
+    for (atlas.files, 0..) |f, fi| {
         if (!std.mem.eql(u8, dir, f.dir)) {
             dir = f.dir;
             try w.print("\n## {s}\n", .{dir});
@@ -242,32 +263,19 @@ pub fn api(arena: Allocator, cfg: *const Config, atlas: model.Atlas) ![]const u8
         if (f.doc.len > 0) try w.print("{s}\n", .{f.doc});
 
         var private: u32 = 0;
-        for (atlas.containers) |c| {
-            if (!std.mem.eql(u8, c.file, f.path)) continue;
+        for (types[fi].items) |c| {
             if (!c.is_pub) {
                 private += 1;
                 continue;
             }
-            try w.print("- {s} `{s}` :{d}", .{ c.kind, c.name, c.line });
-            if (c.fields.len > 0) {
-                try w.writeAll(" {");
-                for (c.fields[0..@min(c.fields.len, 10)], 0..) |field, i| {
-                    try w.print("{s}{s}", .{ if (i > 0) ", " else " ", field.name });
-                    if (field.type.len > 0) try w.print(": {s}", .{field.type});
-                }
-                if (c.fields.len > 10) try w.print(", … {d} more", .{c.fields.len - 10});
-                try w.writeAll(" }");
-            }
-            if (c.doc.len > 0) try w.print(" — {s}", .{c.doc});
-            try w.writeAll("\n");
+            try writeType(w, c);
         }
-        for (atlas.functions) |fun| {
-            if (!std.mem.eql(u8, fun.file, f.path)) continue;
+        for (funs[fi].items) |fun| {
             if (!fun.is_pub) {
                 private += 1;
                 continue;
             }
-            try w.print("- `{s}`{s}{s} :{d}", .{ fun.signature, if (fun.owner.len > 0) " in " else "", fun.owner, fun.line });
+            try w.print("- `{s}`{s}{s}{s} :{d}", .{ fun.signature, if (fun.is_extern) " (extern)" else "", if (fun.owner.len > 0) " in " else "", fun.owner, fun.line });
             if (fun.doc.len > 0) try w.print(" — {s}", .{fun.doc});
             try w.writeAll("\n");
         }
@@ -276,24 +284,54 @@ pub fn api(arena: Allocator, cfg: *const Config, atlas: model.Atlas) ![]const u8
     return out.written();
 }
 
+fn writeType(w: *Writer, c: model.Container) !void {
+    try w.print("- {s}{s} `{s}` :{d}", .{ if (c.tuple) "tuple " else "", c.kind, c.name, c.line });
+    if (c.fields.len > 0) {
+        try w.writeAll(" {");
+        for (c.fields[0..@min(c.fields.len, max_fields)], 0..) |field, i| {
+            try w.print("{s}{s}", .{ if (i > 0) ", " else " ", field.name });
+            if (field.type.len > 0) try w.print(": {s}", .{field.type});
+        }
+        if (c.fields.len > max_fields) try w.print(", … {d} more", .{c.fields.len - max_fields});
+        try w.writeAll(" }");
+    }
+    if (c.doc.len > 0) try w.print(" — {s}", .{c.doc});
+    try w.writeAll("\n");
+}
+
 /// Directory dependency graph, directories grouped by layer.
 pub fn mermaid(arena: Allocator, cfg: *const Config, atlas: model.Atlas) ![]const u8 {
     var out: Writer.Allocating = .init(arena);
     const w = &out.writer;
     try w.writeAll("flowchart TD\n");
 
+    // A directory sits in its layer's group when all its files share that
+    // layer; one holding files of several layers is drawn outside the groups
+    // and labelled with them.
     var dir_layer: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var dir_label: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (atlas.files) |f| {
+        const layer = f.layer orelse "";
         const gop = try dir_layer.getOrPut(arena, f.dir);
-        if (!gop.found_existing) gop.value_ptr.* = f.layer orelse "";
+        if (!gop.found_existing) {
+            gop.value_ptr.* = layer;
+            try dir_label.put(arena, f.dir, layer);
+        } else if (gop.value_ptr.len > 0 and !std.mem.eql(u8, gop.value_ptr.*, layer)) {
+            const label = dir_label.getPtr(f.dir).?;
+            if (std.mem.indexOf(u8, label.*, layer) == null) label.* = try std.fmt.allocPrint(arena, "{s}, {s}", .{ label.*, if (layer.len > 0) layer else "none" });
+            gop.value_ptr.* = "";
+        }
     }
     const layer_names = try arena.alloc([]const u8, cfg.layers.len + 1);
     for (cfg.layers, 0..) |l, i| layer_names[i] = l.name;
     layer_names[cfg.layers.len] = "";
     for (layer_names) |layer| {
         if (layer.len > 0) try w.print("  subgraph layer_{s}[\"{s}\"]\n", .{ try nodeId(arena, layer), layer });
-        for (dir_layer.keys(), dir_layer.values()) |d, l| {
-            if (std.mem.eql(u8, l, layer)) try w.print("    {s}[\"{s}\"]\n", .{ try nodeId(arena, d), d });
+        for (dir_layer.keys(), dir_layer.values(), dir_label.values()) |d, l, label| {
+            if (!std.mem.eql(u8, l, layer)) continue;
+            if (layer.len == 0 and label.len > 0) {
+                try w.print("    {s}[\"{s} ({s})\"]\n", .{ try nodeId(arena, d), d, label });
+            } else try w.print("    {s}[\"{s}\"]\n", .{ try nodeId(arena, d), d });
         }
         if (layer.len > 0) try w.writeAll("  end\n");
     }
@@ -334,4 +372,35 @@ fn nodeId(arena: Allocator, name: []const u8) ![]const u8 {
     id[1] = '_';
     for (name, id[2..]) |c, *o| o.* = if (std.ascii.isAlphanumeric(c)) c else '_';
     return id;
+}
+
+test "the findings section groups findings it is given in any order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var locs = [_]model.Location{.{ .file = "a.zig", .line = 3 }};
+    const findings = [_]model.Finding{
+        .{ .kind = .unused_pub, .severity = .info, .message = "one", .locations = &locs },
+        .{ .kind = .layer_violation, .severity = .@"error", .message = "two", .locations = &locs },
+        .{ .kind = .unused_pub, .severity = .info, .message = "three", .locations = &locs },
+    };
+    var out: Writer.Allocating = .init(arena);
+    try findingSection(arena, &out.writer, &findings);
+    const text = out.written();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "### info: unused_pub (2)"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "### error").? < std.mem.indexOf(u8, text, "### info").?);
+}
+
+test "a directory with files of several layers is drawn outside the layer groups" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg: Config = .{ .layers = &.{ .{ .name = "top", .paths = &.{"src/main.zig"} }, .{ .name = "base", .paths = &.{"src/util.zig"} } } };
+    var files = [_]model.File{
+        .{ .path = "src/main.zig", .dir = "src", .layer = "top" },
+        .{ .path = "src/util.zig", .dir = "src", .layer = "base" },
+    };
+    const atlas: model.Atlas = .{ .files = &files, .functions = &.{}, .containers = &.{}, .findings = &.{}, .stats = .{} };
+    const text = try mermaid(arena, &cfg, atlas);
+    try std.testing.expect(std.mem.indexOf(u8, text, "n_src[\"src (top, base)\"]") != null);
 }
