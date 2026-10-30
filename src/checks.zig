@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const model = @import("model.zig");
 const config = @import("config.zig");
 const Config = config.Config;
+const scan = @import("scan.zig");
 
 /// Look-alike structs need at least this many fields to be worth comparing.
 const min_shape_fields = 3;
@@ -21,7 +22,7 @@ pub fn run(
     files: []model.File,
     functions: []const model.Function,
     containers: []const model.Container,
-    ident_counts: *const std.StringHashMapUnmanaged(u32),
+    names: *const scan.Names,
     findings: *std.ArrayList(model.Finding),
 ) !void {
     var index: std.StringHashMapUnmanaged(u32) = .empty;
@@ -43,7 +44,7 @@ pub fn run(
     try c.fileCycles();
     try c.dirCycles();
     try c.hotspots(functions);
-    try c.unusedPub(functions, ident_counts);
+    try c.unusedPub(functions, containers, names);
     try c.duplicateShapes(containers);
 }
 
@@ -272,14 +273,23 @@ const Checker = struct {
         });
     }
 
-    fn unusedPub(c: *Checker, functions: []const model.Function, ident_counts: *const std.StringHashMapUnmanaged(u32)) !void {
+    fn unusedPub(c: *Checker, functions: []const model.Function, containers: []const model.Container, names: *const scan.Names) !void {
         // Public functions of module roots are the package's API for others.
         var roots: std.StringHashMapUnmanaged(void) = .empty;
         for (c.cfg.modules) |m| try roots.put(c.arena, m.path, {});
+        // Namespaces (structs without fields) handed around as values, like
+        // `App(Commands)`: their functions are found by reflection.
+        var reflected: std.StringHashMapUnmanaged(void) = .empty;
+        for (containers) |ct| {
+            if (ct.fields.len > 0) continue;
+            const simple = if (std.mem.lastIndexOfScalar(u8, ct.name, '.')) |dot| ct.name[dot + 1 ..] else ct.name;
+            if (names.bare.contains(simple)) try reflected.put(c.arena, ct.id, {});
+        }
         for (functions) |f| {
             if (!f.is_pub or f.is_export or f.is_extern or f.allowed != null or roots.contains(f.file)) continue;
             if (isStdHook(f.name)) continue;
-            if ((ident_counts.get(f.name) orelse 0) > 1) continue;
+            if ((names.counts.get(f.name) orelse 0) > 1) continue;
+            if (f.owner.len > 0 and reflected.contains(try std.fmt.allocPrint(c.arena, "{s}:{s}", .{ f.file, f.owner }))) continue;
             try c.add(.unused_pub, .info, try c.one(.{ .file = f.file, .line = f.line, .end_line = f.end_line, .symbol = f.id }), "{s} is public but its name appears nowhere else in the project; if nothing outside calls it, delete it or make it private", .{f.id});
         }
     }
@@ -503,13 +513,11 @@ const Tarjan = struct {
 
 // ---- tests ------------------------------------------------------------------
 
-const scan = @import("scan.zig");
-
 fn runOn(arena: Allocator, cfg: *const Config, files: []const [2][]const u8) ![]const model.Finding {
     var b = scan.Builder.init(arena, cfg);
     for (files) |f| try b.addFile(f[0], try arena.dupeZ(u8, f[1]));
     try b.resolveCalls();
-    try run(arena, cfg, b.files.items, b.functions.items, b.containers.items, &b.ident_counts, &b.findings);
+    try run(arena, cfg, b.files.items, b.functions.items, b.containers.items, &b.names, &b.findings);
     return b.findings.items;
 }
 
@@ -622,9 +630,29 @@ test "unused_pub: an unused function is reported; std hooks, uses elsewhere and 
         \\pub extern fn ext() void;
     );
     try b.countUsage("test { a.usedInTests(); }");
-    try run(arena, &cfg, b.files.items, b.functions.items, b.containers.items, &b.ident_counts, &b.findings);
+    try run(arena, &cfg, b.files.items, b.functions.items, b.containers.items, &b.names, &b.findings);
     try std.testing.expectEqual(@as(usize, 1), countKind(b.findings.items, .unused_pub));
     try std.testing.expectEqualStrings("src/a.zig:neverCalled", b.findings.items[0].locations[0].symbol);
+}
+
+test "unused_pub: a namespace handed around as a value is used by reflection; one that isn't is not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const findings = try runOn(arena_state.allocator(), &.{}, &.{.{
+        "src/app.zig",
+        \\pub const Commands = struct {
+        \\    pub fn open_file() void {}
+        \\};
+        \\pub const Helpers = struct {
+        \\    pub fn neverCalled() void {}
+        \\};
+        \\pub fn main() void {
+        \\    run(.{ .commands = Commands });
+        \\}
+        \\fn run(x: anytype) void { _ = x; }
+    }});
+    try std.testing.expectEqual(@as(usize, 1), countKind(findings, .unused_pub));
+    try std.testing.expectEqualStrings("src/app.zig:Helpers.neverCalled", findings[0].locations[0].symbol);
 }
 
 test "duplicate_shape: same field names are reported; tuples and chains are not" {

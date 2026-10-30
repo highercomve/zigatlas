@@ -34,6 +34,15 @@ pub const Body = struct {
     lines: []const u32,
 };
 
+/// What the whole project does with names: how often each identifier
+/// appears, and which names are handed around as bare values (`App(Commands)`,
+/// `.commands = Commands`), which for a namespace means its declarations are
+/// reached by reflection.
+pub const Names = struct {
+    counts: std.StringHashMapUnmanaged(u32) = .empty,
+    bare: std.StringHashMapUnmanaged(void) = .empty,
+};
+
 /// Collects every scanned file into shared lists.
 pub const Builder = struct {
     arena: Allocator,
@@ -43,8 +52,7 @@ pub const Builder = struct {
     containers: std.ArrayList(model.Container) = .empty,
     findings: std.ArrayList(model.Finding) = .empty,
     bodies: std.ArrayList(Body) = .empty,
-    /// How often each identifier appears across the project.
-    ident_counts: std.StringHashMapUnmanaged(u32) = .empty,
+    names: Names = .{},
     /// File-scope import aliases of each file, to follow re-exports.
     exports: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(Alias)) = .empty,
 
@@ -90,19 +98,29 @@ pub const Builder = struct {
     /// a public function used only there is not reported as unused.
     pub fn countUsage(b: *Builder, source: [:0]const u8) !void {
         var tokenizer = std.zig.Tokenizer.init(source);
+        var prev: std.zig.Token.Tag = .invalid;
+        var pending: ?std.zig.Token = null;
+        var before_pending: std.zig.Token.Tag = .invalid;
         while (true) {
             const tok = tokenizer.next();
-            switch (tok.tag) {
-                .eof => break,
-                .identifier => try b.countIdent(identText(source[tok.loc.start..tok.loc.end])),
-                else => {},
+            if (pending) |p| try b.noteIdent(identText(source[p.loc.start..p.loc.end]), before_pending, tok.tag);
+            pending = null;
+            if (tok.tag == .eof) break;
+            if (tok.tag == .identifier) {
+                pending = tok;
+                before_pending = prev;
             }
+            prev = tok.tag;
         }
     }
 
-    fn countIdent(b: *Builder, name: []const u8) !void {
-        const gop = try b.ident_counts.getOrPut(b.arena, name);
+    /// Counts one identifier, and records it as a bare value when it is not
+    /// being declared, accessed (`name.x`) or called (`name(`).
+    fn noteIdent(b: *Builder, name: []const u8, prev: std.zig.Token.Tag, next: std.zig.Token.Tag) !void {
+        const gop = try b.names.counts.getOrPut(b.arena, name);
         gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        const declared = prev == .keyword_const or prev == .keyword_var or prev == .keyword_fn;
+        if (!declared and next != .period and next != .l_paren) try b.names.bare.put(b.arena, name, {});
     }
 
     /// Rewrites calls made through re-exports (`pkg.settings.cacheInfo(` with
@@ -688,7 +706,9 @@ const FileScan = struct {
         const tags = tree.tokens.items(.tag);
         for (tags, 0..) |tag, i| {
             if (tag != .identifier) continue;
-            try s.b.countIdent(identName(tree, @intCast(i)));
+            const prev: std.zig.Token.Tag = if (i > 0) tags[i - 1] else .invalid;
+            const next: std.zig.Token.Tag = if (i + 1 < tags.len) tags[i + 1] else .eof;
+            try s.b.noteIdent(identName(tree, @intCast(i)), prev, next);
         }
     }
 

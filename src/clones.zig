@@ -20,6 +20,8 @@ const min_same_name_tokens = 20;
 /// Bodies at least this similar (Jaccard of token bigrams) count as the same
 /// job done twice when the functions also share a name.
 const same_name_similarity = 0.5;
+/// Matches between the same two places closer than this many tokens are one match.
+const merge_gap = 4;
 /// Rolling hash base for token windows.
 const window_base: u64 = 1_000_003;
 
@@ -100,7 +102,7 @@ fn fragments(
 ) !void {
     const k = cfg.min_clone_tokens;
     const windows = try collectWindows(arena, k, bodies, functions);
-    const matches = try findMatches(arena, k, bodies, group, windows);
+    const matches = try mergeMatches(arena, try findMatches(arena, k, bodies, group, windows));
     try reportFragments(arena, k, bodies, functions, matches, findings);
 }
 
@@ -207,6 +209,42 @@ fn windowHash(tokens: []const u64) u64 {
     var h: u64 = 0;
     for (tokens) |t| h = h *% window_base +% t;
     return h;
+}
+
+/// One copied region between two places can match at several alignments
+/// (repeating rows shift against each other) or as runs split by a token
+/// that differs. Keeps the longest match per pair of regions: a match
+/// overlapping a kept one on both sides is dropped, and one continuing it at
+/// the same alignment, within `merge_gap` tokens, extends it.
+fn mergeMatches(arena: Allocator, matches: []const Match) ![]Match {
+    var kept: std.ArrayList(Match) = .empty;
+    var by_pair: std.AutoHashMapUnmanaged([2]u32, std.ArrayList(usize)) = .empty;
+    for (matches) |m| {
+        const gop = try by_pair.getOrPut(arena, .{ m.a.body, m.b.body });
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const absorbed = for (gop.value_ptr.items) |ki| {
+            const k = &kept.items[ki];
+            if (!near(k.a.at, k.len, m.a.at, m.len) or !near(k.b.at, k.len, m.b.at, m.len)) continue;
+            if (@as(i64, k.b.at) - k.a.at == @as(i64, m.b.at) - m.a.at) {
+                const lo = @min(k.a.at, m.a.at);
+                const hi = @max(k.a.at + k.len, m.a.at + m.len);
+                k.b.at = k.b.at - (k.a.at - lo);
+                k.a.at = lo;
+                k.len = hi - lo;
+            }
+            break true;
+        } else false;
+        if (absorbed) continue;
+        try gop.value_ptr.append(arena, kept.items.len);
+        try kept.append(arena, m);
+    }
+    std.mem.sort(Match, kept.items, {}, longerFirst);
+    return kept.items;
+}
+
+/// Whether two token ranges overlap or sit within `merge_gap` of each other.
+fn near(a_at: u32, a_len: u32, b_at: u32, b_len: u32) bool {
+    return a_at <= b_at + b_len + merge_gap and b_at <= a_at + a_len + merge_gap;
 }
 
 /// Several copies of one fragment show up as pairs (A,B) (A,C) (B,C):
@@ -500,4 +538,23 @@ test "parallel_implementation: similar same-named bodies are reported once, unre
     for (findings) |f| {
         if (f.kind == .parallel_implementation) try std.testing.expect(std.mem.indexOf(u8, f.message, "a.zig is the natural one") != null);
     }
+}
+
+test "duplicate_fragment: one copied region is reported once, however its rows align" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cfg: Config = .{ .min_clone_tokens = 20, .min_fn_tokens = 1000 };
+    const rows =
+        \\        if (eql(u8, a, "x1")) { show("one", false); } else if (eql(u8, a, "x2")) { show("two", false); }
+        \\        else if (eql(u8, a, "x3")) { show("three", false); } else if (eql(u8, a, "x4")) { show("four", false); }
+        \\        else if (eql(u8, a, "x5")) { show("five", false); } else if (eql(u8, a, "x6")) { show("six", false); }
+    ;
+    const findings = try run(arena_state.allocator(), &cfg, &.{.{
+        "a.zig",
+        "fn onMenu(a: []const u8) void {\n    for (0..1) |_| {\n" ++ rows ++ "\n    }\n}\n" ++
+            "fn onArgs(a: []const u8) void {\n    for (0..1) |_| {\n" ++ rows ++ "\n    }\n}\n" ++
+            "fn eql(comptime T: type, a: []const T, b: []const T) bool { return a.len == b.len; }\n" ++
+            "fn show(n: []const u8, b: bool) void { _ = n; _ = b; }\n",
+    }});
+    try std.testing.expectEqual(@as(usize, 1), count(findings, .duplicate_fragment));
 }

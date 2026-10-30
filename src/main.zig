@@ -71,7 +71,7 @@ fn buildAtlas(arena: Allocator, io: Io, cfg: *const config.Config) !model.Atlas 
     }
 
     try b.resolveCalls();
-    try checks.run(arena, cfg, b.files.items, b.functions.items, b.containers.items, &b.ident_counts, &b.findings);
+    try checks.run(arena, cfg, b.files.items, b.functions.items, b.containers.items, &b.names, &b.findings);
     try clones.detect(arena, cfg, b.bodies.items, b.functions.items, &b.findings);
     checks.sortFindings(b.findings.items);
 
