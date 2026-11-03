@@ -147,3 +147,7 @@ memory and resources, Power of 10, and the tool's design. That last lens covers
 the scan → analysis → render pipeline, the `build.zig` API other projects call,
 and how far each finding kind can be trusted. Reviews are written to
 `.agents/review/<scope>/review.md`.
+
+## License
+
+[MIT](LICENSE) © 2026 Sergio Marin
